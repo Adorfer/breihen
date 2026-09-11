@@ -1033,6 +1033,10 @@ def messe_schaerfe(group, exiftool="exiftool"):
         if _af_position(group, 1.0, 1.0) is None:
             auto = motiv_finden(quellen)
 
+        # Werte erst sammeln und nur bei Erfolg fuer ALLE Bilder zuweisen --
+        # eine halb gemessene Serie wuerde spaeter mit teils fehlenden Werten
+        # sortiert und benannt.
+        werte = []
         for nr, (r, quelldatei) in enumerate(zip(group, quellen), 1):
             FORT.zeige("Schaerfe: messe {} ({}/{}) Serie {}".format(
                 r["name"], nr, len(group), r["gid"]))
@@ -1047,11 +1051,13 @@ def messe_schaerfe(group, exiftool="exiftool"):
                 return False, "leeres Messfenster"
             rms = math.sqrt(float((gewicht * lap * lap).sum()) / summe)
             mittel = float((gewicht * arr).sum() / summe)
-            r["schaerfe"] = rms / (mittel + 1.0) * 10000.0
-    except (OSError, ValueError) as exc:
-        return False, str(exc)
+            werte.append(rms / (mittel + 1.0) * 10000.0)
+    except Exception as exc:        # Messung ist optional: jeder Fehler -> Rueckfall
+        return False, "{}: {}".format(type(exc).__name__, exc)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+    for r, wert in zip(group, werte):
+        r["schaerfe"] = wert
     return True, quelle
 
 
@@ -1362,7 +1368,7 @@ def analysiere(verzeichnis, args):
             schaerfe_hinweise.append((g, info, bleiben_liste[nr]))
             log("schaerfe gid={} dir={} fenster={} bleiben={} werte={}".format(
                 g[0]["gid"], verzeichnis, info, bleiben_liste[nr],
-                ",".join("{}:{}".format(r["name"], int(round(r["schaerfe"])))
+                ",".join("{}:{}".format(r["name"], int(round(r.get("schaerfe") or 0)))
                          for r in g)))
         else:
             schaerfe_hinweise.append((g, "FEHLER: " + info, 1))
@@ -1438,7 +1444,7 @@ def verarbeite(plan, args):
                     shift))
         if start.get("schaerfe") is not None:
             print("  Schaerfe: {} -- {} Bild(er) bleiben liegen (Toleranz {:g}%)"
-                  .format(", ".join("{}={}".format(r["name"], int(round(r["schaerfe"])))
+                  .format(", ".join("{}={}".format(r["name"], int(round(r.get("schaerfe") or 0)))
                                     for r in group),
                           bleiben, args.schaerfe_toleranz))
 
