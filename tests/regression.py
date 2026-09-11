@@ -96,10 +96,13 @@ def _fake_read_metadata(orig):
     return fake
 
 
-def lauf(d, *args):
-    """breihen.main() im selben Prozess; liefert (exit, stdout, stderr)."""
+def lauf(d, *args, patch=None):
+    """breihen.main() im selben Prozess; liefert (exit, stdout, stderr).
+    patch(modul) darf nach dem Neuladen einzelne Funktionen ersetzen."""
     importlib.reload(breihen)
     breihen.read_metadata = _fake_read_metadata(breihen.read_metadata)
+    if patch:
+        patch(breihen)
     o, e = io.StringIO(), io.StringIO()
     try:
         with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
@@ -381,6 +384,107 @@ def unvollstaendige_serie():
     rc, o, e = lauf(d)
     check("Halbfertige Serie: als UNVOLLSTAENDIG gemeldet, exit 1",
           "UNVOLLSTAENDIG" in o and rc == 1, str(rc) + o[-300:])
+
+
+# ---------------------------------------------------------------------------
+# Tests: --zeiten-nachziehen
+# ---------------------------------------------------------------------------
+
+def _zeitschreiben_scheitert_fuer(praefix):
+    """patch-Funktion: set_times scheitert fuer Dateien mit diesem Namenspraefix."""
+    def patch(modul):
+        echt = modul.set_times
+
+        def set_times(targets, dt, subsec, exiftool="exiftool"):
+            if any(os.path.basename(t).startswith(praefix) for t in targets):
+                return False, "simuliert: Netzlaufwerk weg"
+            return echt(targets, dt, subsec, exiftool)
+        modul.set_times = set_times
+    return patch
+
+
+def _zwei_serien_b_scheitert(name, ext=".jpeg", begleiter=None):
+    """A und B zu dicht (B wird auf 09:00:32 geplant); Zeitschreiben fuer B scheitert."""
+    d = neu(name)
+    for k, b in enumerate("AB"):
+        for i, ev in enumerate([0.0, -1.0, 1.0]):
+            for e in [ext] + ([begleiter] if begleiter else []):
+                bild(d, "%s%02d%s" % (b, i, e), "2024:02:14 09:00:%02d" % (k * 5 + i),
+                     meta=dict(gid=100 + k, ev=ev))
+    rc, o, e = lauf(d, patch=_zeitschreiben_scheitert_fuer("B00_"))
+    return d, rc
+
+
+def _mtime_sekunde(p):
+    from datetime import datetime
+    return datetime.fromtimestamp(os.stat(p).st_mtime).strftime("%Y:%m:%d %H:%M:%S")
+
+
+@test
+def nachziehen_repariert():
+    d, rc = _zwei_serien_b_scheitert("nachziehen")
+    b = os.path.join(d, "breihen")
+    vorher = zeiten(b)
+    check("Nachziehen: Ausgangslage -- Ablauf mit Zeitfehler endet mit exit 1", rc == 1, rc)
+    check("Nachziehen: Ausgangslage -- B liegt mit Originalzeit in breihen/",
+          vorher.get("B00_N1G3_(B+0).jpeg") == "2024:02:14 09:00:05", vorher)
+    rc2, o, e = lauf(d, "--zeiten-nachziehen")
+    t = zeiten(b)
+    check("Nachziehen: exit 0", rc2 == 0, str(rc2) + o + e)
+    check("Nachziehen: B auf den geplanten Zeitpunkt gezogen (09:00:32 / :33)",
+          t.get("B00_N1G3_(B+0).jpeg") == "2024:02:14 09:00:32"
+          and t.get("B00_N3_(B+1)_B02.jpeg") == "2024:02:14 09:00:33", t)
+    check("Nachziehen: Dateidatum mitgezogen",
+          _mtime_sekunde(os.path.join(b, "B00_N1G3_(B+0).jpeg")) == "2024:02:14 09:00:32",
+          _mtime_sekunde(os.path.join(b, "B00_N1G3_(B+0).jpeg")))
+    check("Nachziehen: A unveraendert", t.get("A00_N1G3_(B+0).jpeg") == "2024:02:14 09:00:00", t)
+    rc3, o3, e3 = lauf(d, "--zeiten-nachziehen")
+    check("Nachziehen: zweiter Durchgang findet nichts mehr",
+          rc3 == 0 and "0 Datei(en) abweichend" in o3, o3[-300:])
+
+
+@test
+def nachziehen_intakt_schreibt_nichts():
+    d = neu("nachziehen_intakt")
+    for i, ev in enumerate([0.0, -1.0, 1.0]):
+        bild(d, "A%02d.jpeg" % i, "2024:02:14 09:00:0%d" % i, meta=dict(gid=100, ev=ev))
+    lauf(d)
+    b = os.path.join(d, "breihen")
+    vorher = {f: os.stat(os.path.join(b, f)).st_mtime_ns for f in ls(b)}
+    rc, o, e = lauf(d, "--zeiten-nachziehen")
+    nachher = {f: os.stat(os.path.join(b, f)).st_mtime_ns for f in ls(b)}
+    check("Nachziehen auf intaktem Ordner: nichts geschrieben",
+          rc == 0 and vorher == nachher and "0 Datei(en) abweichend" in o, o[-300:])
+
+
+@test
+def nachziehen_probelauf():
+    d, _ = _zwei_serien_b_scheitert("nachziehen_probe")
+    b = os.path.join(d, "breihen")
+    vorher = zeiten(b)
+    rc, o, e = lauf(d, "--zeiten-nachziehen", "-n")
+    check("Nachziehen -n: meldet Abweichung, aendert nichts",
+          "abweichend" in o and "Probelauf" in o and zeiten(b) == vorher, o[-300:])
+
+
+@test
+def nachziehen_paare():
+    d, _ = _zwei_serien_b_scheitert("nachziehen_paare", ext=".JPG", begleiter=".TIF")
+    lauf(d, "--zeiten-nachziehen")
+    t = zeiten(os.path.join(d, "breihen"))
+    check("Nachziehen: Begleitdateien werden mitkorrigiert",
+          t.get("B00_N1G3_(B+0).TIF") == "2024:02:14 09:00:32"
+          and t.get("B00_N2_(B-1)_B01.TIF") == "2024:02:14 09:00:33", t)
+
+
+@test
+def nachziehen_ohne_startaufnahme_im_quellordner():
+    d, _ = _zwei_serien_b_scheitert("nachziehen_ohnequelle")
+    os.unlink(os.path.join(d, "B00.jpeg"))
+    rc, o, e = lauf(d, "--zeiten-nachziehen")
+    t = zeiten(os.path.join(d, "breihen"))
+    check("Nachziehen ohne Quell-Startaufnahme: Hinweis und Zeit aus breihen/",
+          "fehlt im Quellordner" in o and t.get("B00_N1G3_(B+0).jpeg") == "2024:02:14 09:00:32", (o[-300:], t))
 
 
 # ---------------------------------------------------------------------------

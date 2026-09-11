@@ -1749,6 +1749,8 @@ def verarbeite(plan, args):
                         len(ziele)))
                 else:
                     print("  ! exiftool (Zeit): {}".format(err))
+                    print("  ! Dateien liegen schon in breihen/ -- Zeiten spaeter mit "
+                          "--zeiten-nachziehen korrigieren")
                     log("zeit-fehler gid={} grund={}".format(start["gid"], err))
                     n_err += 1
         elif args.set_time and (ziele_start or ziele_folge) and not neue_zeit:
@@ -1765,8 +1767,201 @@ def verarbeite(plan, args):
 
 
 # ---------------------------------------------------------------------------
+# Zeiten nachziehen (--zeiten-nachziehen)
+# ---------------------------------------------------------------------------
+
+# Namen in breihen/ zerlegen: Startaufnahme bzw. Folgeaufnahme -> Stamm der
+# Startaufnahme. Der Stamm verbindet alle Dateien einer abgelegten Serie.
+_NAME_START = re.compile(r"^(.*)_N1G\d+_\([^)]*\)\.[^.]+$")
+_NAME_FOLGE = re.compile(r"^(.*?)_N\d+_\([^)]*\)_.+$")
+
+
+def _sekunde(dt):
+    return dt.replace(microsecond=0) if dt else None
+
+
+def zeiten_nachziehen(verzeichnis, args):
+    """Zeiten der schon abgelegten Serien in breihen/ pruefen und korrigieren.
+
+    Hintergrund: Scheitert exiftool beim Zeitschreiben NACH dem Verschieben,
+    liegen die Dateien fertig benannt, aber mit Originalzeiten in breihen/ --
+    und jeder weitere Lauf haelt die Serie fuer erledigt.
+
+    Rekonstruiert wird alles aus dem, was noch da ist: die Namen in breihen/
+    ordnen die Dateien ihren Serien zu, die unveraendert im Quellordner
+    liegenden Startaufnahmen liefern die Original-Zeit T, die Dateien selbst
+    die Belichtungszeiten fuer den Langzeit-Zuschlag. Daraus wird der
+    Zeitplan (Mindestabstand, Kaskade) ueber ALLE abgelegten Serien des
+    Ordners neu berechnet; geschrieben werden nur abweichende Dateien
+    (EXIF-Aufnahmezeit oder Dateidatum). Neue Serien werden nicht angefasst.
+
+    Rueckgabe: (serien, korrigierte_dateien, fehler) oder None ohne breihen/.
+    """
+    destdir = os.path.join(verzeichnis, args.dest)
+    if not os.path.isdir(destdir):
+        return None
+
+    serien = {}
+    for n in sorted(os.listdir(destdir)):
+        m = _NAME_START.match(n)
+        rolle = "start"
+        if not m:
+            m = _NAME_FOLGE.match(n)
+            rolle = "folge"
+        if m:
+            serien.setdefault(m.group(1), {"start": [], "folge": []})[rolle].append(
+                os.path.join(destdir, n))
+    if not serien:
+        return None
+
+    kopf = "[Laufzeit {}]".format(laufzeit_text())
+    if args.rekursiv:
+        kopf += " " + os.path.relpath(verzeichnis, args.startdir)
+    FORT.leeren()
+    print(kopf)
+    print("Zeiten nachziehen: {} -- {} abgelegte Serie(n)".format(destdir, len(serien)))
+
+    FORT.zeige("lese Originalzeiten in {}".format(verzeichnis))
+    quelle = collect_files(verzeichnis)
+    q_nach_stamm = {}
+    for r in (read_metadata(quelle, args.exiftool) if quelle else []):
+        q_nach_stamm.setdefault(r["stem"], []).append(r)
+
+    b_pfade = [p for s_ in serien.values() for p in s_["start"] + s_["folge"]]
+    b_recs = {r["path"]: r for r in read_metadata(
+        b_pfade, args.exiftool,
+        fortschritt=lambda n: FORT.zeige("lese breihen/: {}/{}".format(n, len(b_pfade))))}
+    FORT.leeren()
+
+    fehler = 0
+    eintraege = []
+    for stamm, dateien in sorted(serien.items()):
+        if not dateien["start"]:
+            print("  ! {}: Folgeaufnahmen ohne Startaufnahme in breihen/ -- uebersprungen"
+                  .format(stamm))
+            log("nachziehen-uebersprungen dir={} start={} grund=keine-startaufnahme"
+                .format(verzeichnis, stamm))
+            fehler += 1
+            continue
+        quellrecs = sorted(q_nach_stamm.get(stamm, []), key=_format_rang)
+        if quellrecs and quellrecs[0]["dt"]:
+            ref = quellrecs[0]
+        else:
+            ref = b_recs.get(dateien["start"][0])
+            if not ref or not ref["dt"]:
+                print("  ! {}: keine Aufnahmezeit ermittelbar -- uebersprungen".format(stamm))
+                log("nachziehen-uebersprungen dir={} start={} grund=keine-zeit"
+                    .format(verzeichnis, stamm))
+                fehler += 1
+                continue
+            print("  ! {}: Startaufnahme fehlt im Quellordner -- Zeit aus breihen/ "
+                  "uebernommen".format(stamm))
+        alle = dateien["start"] + dateien["folge"]
+        gruppe = [{"dt": ref["dt"], "subsec": ref["subsec"], "name": stamm,
+                   "belichtung": ref.get("belichtung") or 0.0}]
+        gruppe += [{"belichtung": b_recs[p_].get("belichtung") or 0.0}
+                   for p_ in alle if p_ in b_recs]
+        eintraege.append((stamm, dateien, ref, gruppe))
+
+    eintraege.sort(key=lambda e: sort_key(e[3][0]))
+    plan = enforce_min_spacing([e[3] for e in eintraege], args.min_abstand,
+                               args.lange_belichtung)
+
+    korrigiert = abweichend_gesamt = 0
+    for (stamm, dateien, ref, _g), (soll_t, _shift, _z) in zip(eintraege, plan):
+        soll_f = soll_t + timedelta(seconds=args.folge_offset)
+        abweichend = {"start": [], "folge": []}
+        for rolle, soll in (("start", soll_t), ("folge", soll_f)):
+            for p_ in dateien[rolle]:
+                ist = b_recs.get(p_, {}).get("dt")
+                try:
+                    mtime = datetime.fromtimestamp(os.stat(p_).st_mtime)
+                except OSError:
+                    mtime = None
+                if _sekunde(ist) != soll or _sekunde(mtime) != soll:
+                    abweichend[rolle].append(p_)
+        n_abw = len(abweichend["start"]) + len(abweichend["folge"])
+        abweichend_gesamt += n_abw
+        if not n_abw:
+            if args.verbose:
+                print("  {}: ok ({} Datei(en))".format(stamm, len(dateien["start"]) +
+                                                       len(dateien["folge"])))
+            continue
+        print("  {}: {} Datei(en) abweichend -> Start {}, Folge {}{}".format(
+            stamm, n_abw, soll_t.strftime("%Y-%m-%d %H:%M:%S"),
+            soll_f.strftime("%H:%M:%S"), "  (Probelauf)" if args.dry_run else ""))
+        if args.dry_run:
+            log("geplant-zeit-nachziehen dir={} start={} dateien={} soll={}".format(
+                verzeichnis, stamm, n_abw, soll_t.strftime("%Y-%m-%dT%H:%M:%S")))
+            continue
+        for rolle, zeitpunkt in (("start", soll_t), ("folge", soll_f)):
+            ziele = abweichend[rolle]
+            if not ziele:
+                continue
+            ok, err = set_times(ziele, zeitpunkt, ref["subsec"], args.exiftool)
+            if ok:
+                korrigiert += len(ziele)
+                log("zeit-nachgezogen dir={} start={} rolle={} dateien={} zeit={}".format(
+                    verzeichnis, stamm, rolle, len(ziele),
+                    zeitpunkt.strftime("%Y-%m-%dT%H:%M:%S")))
+            else:
+                fehler += 1
+                print("  ! exiftool (Zeit): {}".format(err))
+                log("zeit-fehler dir={} start={} rolle={} grund={}".format(
+                    verzeichnis, stamm, rolle, err))
+
+    print("  -> {} Serie(n) geprueft, {} Datei(en) abweichend, {} korrigiert, "
+          "{} Fehler\n".format(len(eintraege), abweichend_gesamt, korrigiert, fehler))
+    log("nachziehen dir={} serien={} korrigiert={} fehler={}".format(
+        verzeichnis, len(eintraege), korrigiert, fehler))
+    return len(eintraege), korrigiert, fehler
+
+
+# ---------------------------------------------------------------------------
 # Hauptprogramm
 # ---------------------------------------------------------------------------
+
+def nachziehen_lauf(verzeichnisse, args):
+    """--zeiten-nachziehen ueber alle Verzeichnisse; eigener Kurz-Preflight."""
+    print()
+    if not args.dry_run:
+        # Nur breihen/-Verzeichnisse brauchen Schreibrechte -- und nur dort,
+        # wo tatsaechlich etwas liegt.
+        probleme = []
+        for d in verzeichnisse:
+            dest = os.path.join(d, args.dest)
+            if os.path.isdir(dest):
+                FORT.zeige("pruefe Rechte: {}".format(dest))
+                probleme += _test_verzeichnis(dest, "Zielverzeichnis " + dest)
+        FORT.leeren()
+        if probleme:
+            sys.stdout.flush()
+            print(("ABBRUCH" if args.rechte_pruefen else "WARNUNG")
+                  + ": Rechtepruefung fehlgeschlagen:", file=sys.stderr)
+            for f in probleme:
+                print("  - " + f, file=sys.stderr)
+                log("preflight-fehler grund={}".format(f))
+            if args.rechte_pruefen:
+                log("abbruch grund=preflight laufzeit={}".format(laufzeit_text()))
+                return 2
+    n_serien = n_korr = n_fehl = 0
+    for nr, d in enumerate(verzeichnisse, 1):
+        FORT.zeige("Zeiten nachziehen {}/{}: {}".format(nr, len(verzeichnisse), d))
+        erg = zeiten_nachziehen(d, args)
+        if erg:
+            n_serien += erg[0]
+            n_korr += erg[1]
+            n_fehl += erg[2]
+    FORT.leeren()
+    if args.dry_run:
+        print("Probelauf -- es wurde nichts veraendert.")
+    else:
+        print("Fertig: {} Serie(n) geprueft, {} Datei(en) korrigiert, {} Fehler."
+              .format(n_serien, n_korr, n_fehl))
+    log("ende modus=nachziehen serien={} korrigiert={} fehler={} laufzeit={}".format(
+        n_serien, n_korr, n_fehl, laufzeit_text()))
+    return 1 if (n_fehl or ANALYSE_FEHLER) else 0
+
 
 def main(argv=None):
     p = argparse.ArgumentParser(
@@ -1799,6 +1994,11 @@ def main(argv=None):
     p.add_argument("--schaerfe-toleranz", type=float, default=5.0, metavar="PROZENT",
                    help="Bilder, die weniger als PROZENT unter dem schaerfsten liegen, "
                         "bleiben ebenfalls im Originalverzeichnis (Vorgabe: 5)")
+    p.add_argument("--zeiten-nachziehen", action="store_true",
+                   help="Nur reparieren: Zeiten der bereits in breihen/ abgelegten "
+                        "Serien pruefen und abweichende korrigieren (z.B. nach einem "
+                        "gescheiterten Zeitschreiben). Neue Serien werden nicht "
+                        "bearbeitet. Dieselben Zeit-Optionen wie beim Ablegen verwenden.")
     p.add_argument("--schaerfe-bericht", action="store_true",
                    help="Nur die Schaerfewerte je Serie ausgeben und beenden -- "
                         "nichts kopieren, verschieben oder aendern")
@@ -1848,6 +2048,8 @@ def main(argv=None):
 
     if args.schaerfe_bericht:
         args.schaerfe = True
+    if args.zeiten_nachziehen and args.schaerfe_bericht:
+        p.error("--zeiten-nachziehen und --schaerfe-bericht schliessen sich aus")
 
     if args.allbracketing or args.typen.strip().lower() in ("alle", "all"):
         args.typen = set(ALLE_TYPEN)
@@ -1873,8 +2075,9 @@ def main(argv=None):
         log_oeffnen(args.logfile or os.path.join(startdir, "breihen.log"))
     log("start dir={} modus={} typen={} rekursiv={} argv={}".format(
         startdir,
-        "probelauf" if args.dry_run else
-        ("bericht" if args.schaerfe_bericht else "echt"),
+        ("nachziehen-" if args.zeiten_nachziehen else "")
+        + ("probelauf" if args.dry_run else
+           ("bericht" if args.schaerfe_bericht else "echt")),
         ",".join(sorted(args.typen)), int(args.rekursiv),
         " ".join(argv if argv is not None else sys.argv[1:])))
 
@@ -1888,6 +2091,9 @@ def main(argv=None):
         if args.verbose:
             for d in uebersprungene_verz:
                 print("  ausgelassen: {}".format(d))
+
+    if args.zeiten_nachziehen:
+        return nachziehen_lauf(verzeichnisse, args)
 
     plaene = []
     for nr, d in enumerate(verzeichnisse, 1):
