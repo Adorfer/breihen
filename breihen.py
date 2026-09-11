@@ -807,6 +807,27 @@ def plan_group(group, destdir, ev_mode="truncate", typen=None, bleiben=1):
 # Zeitstempel setzen
 # ---------------------------------------------------------------------------
 
+def kopieren_atomar(quelle, ziel):
+    """Kopie ueber einen Temp-Namen im Zielverzeichnis, dann os.replace.
+
+    Ein Abbruch mitten in copy2 (Ctrl-C, Netz weg, Platte voll) hinterlaesst
+    so keine abgeschnittene Datei unter dem endgueltigen Namen, die spaeter
+    als "bereits abgelegt" gelten wuerde. Der Temp-Name beginnt mit einem
+    Punkt und wird weder von der Ablage-Pruefung noch von Photomatix erfasst.
+    """
+    tmp = os.path.join(os.path.dirname(ziel), ".breihen-tmp.{}.{}".format(
+        os.getpid(), os.path.basename(ziel)))
+    try:
+        shutil.copy2(quelle, tmp)
+        os.replace(tmp, ziel)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def set_times(targets, dt, subsec, exiftool="exiftool"):
     """EXIF-Aufnahmezeit und Dateidatum aller Zieldateien auf dt setzen."""
     if not targets or dt is None:
@@ -1478,8 +1499,10 @@ def verarbeite(plan, args):
                           bleiben, args.schaerfe_toleranz))
 
         ziele_start, ziele_folge = [], []
+        abgebrochen = False
         for nr, (rec, target, action) in enumerate(ops):
-            eimer = ziele_start if nr == 0 else ziele_folge
+            ist_start = (nr == 0)
+            eimer = ziele_start if ist_start else ziele_folge
             marker = "kopieren" if action == "copy" else "verschieben"
             aktion_name = "kopiert" if action == "copy" else "verschoben"
             if os.path.exists(target):
@@ -1487,6 +1510,15 @@ def verarbeite(plan, args):
                 log("ziel-existiert gid={} quelle={} ziel={}".format(
                     start["gid"], rec["path"], target))
                 n_skip += 1
+                if ist_start:
+                    # Ohne eigene Startkopie keine Folgebilder verschieben --
+                    # sonst entsteht in breihen/ eine Serie ohne N1-Bild.
+                    print("  ! Serie abgebrochen: Startbild nicht ablegbar")
+                    log("serie-abgebrochen gid={} dir={} start={} grund=ziel-existiert"
+                        .format(start["gid"], plan["dir"], start["name"]))
+                    n_skip += len(ops) - 1
+                    abgebrochen = True
+                    break
                 continue
             print("  {:<11} {:<26} -> {}".format(marker, rec["name"], os.path.basename(target)))
             if args.dry_run:
@@ -1496,7 +1528,7 @@ def verarbeite(plan, args):
                 continue
             try:
                 if action == "copy":
-                    shutil.copy2(rec["path"], target)
+                    kopieren_atomar(rec["path"], target)
                     n_copy += 1
                 else:
                     shutil.move(rec["path"], target)
@@ -1509,6 +1541,17 @@ def verarbeite(plan, args):
                 log("fehler gid={} quelle={} ziel={} grund={}".format(
                     start["gid"], rec["path"], target, exc))
                 n_err += 1
+                if ist_start:
+                    print("  ! Serie abgebrochen: Startkopie fehlgeschlagen, "
+                          "Folgebilder bleiben unangetastet liegen")
+                    log("serie-abgebrochen gid={} dir={} start={} grund=startkopie"
+                        .format(start["gid"], plan["dir"], start["name"]))
+                    abgebrochen = True
+                    break
+
+        if abgebrochen:
+            print()
+            continue
 
         if args.set_time and (ziele_start or ziele_folge) and neue_zeit:
             folgezeit = neue_zeit + timedelta(seconds=args.folge_offset)
