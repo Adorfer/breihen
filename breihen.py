@@ -197,6 +197,7 @@ READ_TAGS = [
     "-CreateDate",
     "-ExposureTime",
     "-BulbDuration",
+    "-SerialNumber",
     # Zur Unterscheidung der Bracketing-Arten
     "-FlashExposureBracketValue",
     "-ActiveD-Lighting",
@@ -272,6 +273,21 @@ AUTOBRACKETSET_TEXT = {0: "AE & Blitz", 1: "nur AE", 2: "nur Blitz",
 # werden.
 SKIP_DIR_PREFIXES = ("photomatixresults",)
 SKIP_DIR_ANZEIGE = ("PhotomatixResults",)
+
+# Die BurstGroupID ist KEIN Serienzaehler, sondern (Bildnummer des ersten
+# Serienbilds x 32) mod 65536 -- effektiv ein 11-bit-Bildzaehler, der alle
+# 2048 Aufnahmen umlaeuft. Nachgemessen an einer Z5II (Oktober 2025): alle IDs
+# Vielfache von 32, Sprung zwischen Serien = 32 x Bildanzahl der vorigen,
+# bei ~6400 Aufnahmen in vier Tagen dreimal umgelaufen, dieselbe ID an zwei
+# verschiedenen Tagen vergeben. Ein Ordner mit mehr als 2048 Aufnahmen kann
+# also fremde Serien gleicher ID enthalten.
+#
+# Abhilfe: Obergrenze fuer den Abstand zweier Aufnahmen DERSELBEN Serie --
+# 2 x Belichtungszeit des vorigen Bildes (Belichtung + gleich lange
+# Langzeit-Rauschunterdrueckung) plus diese Reserve. Gemessen lagen innerhalb
+# echter Serien hoechstens 1 s zwischen zwei Bildern, Kollisionen dagegen
+# Stunden bis Tage auseinander.
+SERIEN_LUECKE_AUTO = 30.0
 
 # Bezugspunkt fuer die Laufzeitanzeige; main() setzt ihn beim Start neu.
 START_ZEIT = time.monotonic()
@@ -515,6 +531,7 @@ def read_metadata(paths, exiftool="exiftool", fortschritt=None):
             "bracketset": (BRACKETSET_TEXT.get(d.get("BracketSet"))
                            or AUTOBRACKETSET_TEXT.get(d.get("AutoBracketSet"))),
             "af": dict((k, d.get(k)) for k in AF_TAGS),
+            "serial": str(d.get("SerialNumber") or "").strip(),
         })
     return recs
 
@@ -689,32 +706,50 @@ def sort_key(rec):
     return (dt, sub, rec["name"])
 
 
-def build_groups(recs, min_size=2, max_gap=0.0):
-    """Nach BurstGroupID gruppieren, innerhalb der Gruppe nach Aufnahmezeit sortieren."""
-    by_gid = {}
+def _serie_reisst(prev, cur, max_gap):
+    """Liegt zwischen zwei Aufnahmen mit gleicher BurstGroupID zu viel Zeit?
+
+    max_gap None = automatisch (2 x Belichtung + SERIEN_LUECKE_AUTO),
+    0 = nie trennen, > 0 = feste Obergrenze in Sekunden.
+    """
+    if max_gap == 0 or not prev["dt"] or not cur["dt"]:
+        return False
+    luecke = (cur["dt"] - prev["dt"]).total_seconds()
+    if max_gap is None:
+        grenze = 2.0 * (prev.get("belichtung") or 0.0) + SERIEN_LUECKE_AUTO
+    else:
+        grenze = max_gap
+    return luecke > grenze
+
+
+def build_groups(recs, min_size=2, max_gap=None):
+    """Nach (Kamera-Seriennummer, BurstGroupID) gruppieren, innerhalb der
+    Gruppe nach Aufnahmezeit sortieren und bei unplausiblen Zeitluecken
+    trennen.
+
+    Die Seriennummer gehoert in den Schluessel, weil die BurstGroupID nur ein
+    Zaehler je Body ist: zwei Kameras im selben Ordner koennen dieselbe ID
+    vergeben. Fehlt die Seriennummer, zaehlt nur die ID.
+    """
+    by_key = {}
     skipped = []
     for r in recs:
         if not r["gid"]:          # None oder 0 == kein Serienbild
             skipped.append(r)
             continue
-        by_gid.setdefault(r["gid"], []).append(r)
+        by_key.setdefault((r.get("serial") or "", r["gid"]), []).append(r)
 
     groups = []
-    for gid in sorted(by_gid):
-        items = sorted(by_gid[gid], key=sort_key)
+    for key in sorted(by_key):
+        items = sorted(by_key[key], key=sort_key)
 
-        # Optional: gleiche BurstGroupID, aber grosser zeitlicher Abstand
-        # (z.B. Zaehler-Ueberlauf der Kamera) -> in Teilserien zerlegen.
-        chunks = [items]
-        if max_gap > 0:
-            chunks, cur = [], [items[0]]
-            for prev, cur_rec in zip(items, items[1:]):
-                if prev["dt"] and cur_rec["dt"] and \
-                        (cur_rec["dt"] - prev["dt"]).total_seconds() > max_gap:
-                    chunks.append(cur)
-                    cur = []
-                cur.append(cur_rec)
-            chunks.append(cur)
+        chunks, cur = [], [items[0]]
+        for prev, cur_rec in zip(items, items[1:]):
+            if _serie_reisst(prev, cur_rec, max_gap):
+                chunks.append(cur)
+                cur = []
+            cur.append(cur_rec)
+        chunks.append(cur)
 
         for c in chunks:
             if len(c) >= min_size:
@@ -1625,9 +1660,11 @@ def main(argv=None):
                         "nichts kopieren, verschieben oder aendern")
     p.add_argument("--min-size", type=int, default=2,
                    help="Mindestanzahl Bilder je Serie (Vorgabe: 2)")
-    p.add_argument("--max-gap", type=float, default=0.0, metavar="SEK",
-                   help="Serie zerlegen, wenn zwischen zwei Aufnahmen mehr als SEK "
-                        "Sekunden liegen (0 = aus)")
+    p.add_argument("--max-gap", type=float, default=None, metavar="SEK",
+                   help="Serie zerlegen, wenn zwischen zwei Aufnahmen mit gleicher "
+                        "BurstGroupID mehr als SEK Sekunden liegen. Vorgabe: "
+                        "automatisch, 2 x Belichtungszeit + 30 s (faengt Zaehler-"
+                        "Ueberlauf und -Reset ab); 0 = nie zerlegen")
     p.add_argument("--min-abstand", type=float, default=32.0, metavar="SEK",
                    help="Mindestabstand der Startzeitpunkte zweier Serien; "
                         "zu dicht liegende Serien werden nach hinten geschoben "
