@@ -57,10 +57,19 @@ Doku: 1505b45. Tests: 45fcf35 ([tests/regression.py](../tests/regression.py), 28
 - **Echte NEF-Paare nie getestet** — Fake-NEFs (JPEG-Inhalt) kann exiftool nicht
   beschreiben; Zeit-Test der Begleitdateien lief mit TIFF. Erster echter RAW+JPEG-Lauf
   mit `--dry-run`, danach Zeiten der NEFs in breihen/ kontrollieren.
-- **Zeit-Schreiben scheitert NACH dem Verschieben** → Dateien liegen in breihen/,
-  Zeiten falsch, nur `zeit-fehler` im Log + Exit 1. Zweitlauf hält die Serie für
-  erledigt und korrigiert nichts. Abhilfe wäre ein Journal oder ein
-  `--zeiten-nachziehen`-Modus.
+- ~~Zeit-Schreiben scheitert NACH dem Verschieben → Zweitlauf korrigiert nichts.~~
+  Gelöst mit `--zeiten-nachziehen` (5543d67): Serien über die Namen in breihen/
+  rekonstruiert, Original-T aus den unveränderten Startaufnahmen im Quellordner
+  (ersatzweise aus breihen/), Zeitplan neu, nur Abweichungen (EXIF-Zeit oder
+  Dateidatum) neu geschrieben.
+  - Der Plan wird über **alle** abgelegten Serien eines breihen/ berechnet. Wurden
+    Serien in getrennten Läufen abgelegt (erst `--typen ae`, später `keine`),
+    kann das Nachziehen deren Zeiten gegeneinander verschieben — gewollt, denn
+    Photomatix sieht den ganzen Ordner.
+  - Nicht-Standard-Zeitoptionen (`--min-abstand` usw.) müssen beim Nachziehen
+    wieder angegeben werden, sonst wird auf die Vorgaben "korrigiert".
+  - Warum kein Journal: mehr Zustand, der kaputtgehen kann; alle nötigen Daten
+    liegen ohnehin noch vor.
 - **C120-Randfall**: eine Serie von genau 2048 Frames (oder Summe bis zur nächsten)
   → Folgeserie gleiche ID und zeitlich direkt dahinter → würde verschmolzen. Für AEB
   irrelevant.

@@ -70,6 +70,10 @@ protokolliert nach `breihen.log` (grep-freundlich, mit Prozess-ID).
 - **Ein zweiter Lauf ist unschädlich.** Bereits abgelegte Serien werden
   übersprungen; eine nur teilweise abgelegte Serie (früherer Lauf
   abgebrochen) wird als *unvollständig* gemeldet und nicht angefasst.
+- **Zeiten reparieren:** Scheitert das Zeitschreiben erst nach dem Verschieben
+  (z. B. Netzlaufwerk weg), korrigiert `--zeiten-nachziehen` die bereits
+  abgelegten Serien — nur abweichende Dateien werden neu geschrieben, mit
+  `-n` nur angezeigt. Dieselben Zeit-Optionen wie beim Ablegen verwenden.
 
 ## Installation (Ubuntu 26.04)
 

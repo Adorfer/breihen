@@ -58,6 +58,12 @@ deren Aufnahmen schon in breihen/ liegen, wird uebersprungen. Liegt nur ein
 Teil dort (frueherer Lauf abgebrochen), wird die Serie als UNVOLLSTAENDIG
 gemeldet und nicht angefasst.
 
+Scheitert das Zeitschreiben erst nach dem Verschieben, repariert
+--zeiten-nachziehen die schon abgelegten Serien: Zeitplan aus den
+unveraenderten Startaufnahmen im Quellordner neu berechnen, nur abweichende
+Dateien neu schreiben. Dabei dieselben Zeit-Optionen verwenden wie beim
+Ablegen (--min-abstand, --folge-offset, --lange-belichtung).
+
 Bearbeitet werden per Vorgabe nur echte BELICHTUNGSREIHEN, also Serien, in
 denen sich der ExposureBracketValue tatsaechlich aendert. Serien, deren Bilder
 alle mit derselben Belichtung aufgenommen wurden, bleiben unangetastet
