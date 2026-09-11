@@ -113,6 +113,11 @@ erzeugte Bilder schreiben; die Tests injizieren `BurstGroupID` & Co. deshalb
 beim Einlesen — Gruppieren, Messen, Kopieren, Verschieben und Zeitschreiben
 laufen echt.
 
+## Hintergrund
+
+Entscheidungen, Messungen zur `BurstGroupID` und offene Punkte:
+[docs/NOTES.md](docs/NOTES.md).
+
 ## Lizenz
 
 [BSD-3-Clause](LICENSE)
