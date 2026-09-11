@@ -706,6 +706,48 @@ def sort_key(rec):
     return (dt, sub, rec["name"])
 
 
+# Welche Datei einer Aufnahme fuehrt, wenn die Kamera mehrere Formate
+# schreibt (RAW+JPEG)? Die fuehrende Datei wird gemessen und einsortiert, die
+# anderen laufen als Begleitdateien mit. JPEG zuerst, weil die
+# Schaerfemessung dort direkt aus den DCT-Daten liest statt aus einer
+# eingebetteten RAW-Vorschau.
+def _format_rang(rec):
+    ext = rec["ext"].lower()
+    if ext in (".jpg", ".jpeg", ".jpe", ".jfif"):
+        return 0
+    if ext in (".heic", ".heif", ".hif"):
+        return 1
+    if ext in (".tif", ".tiff"):
+        return 2
+    return 3
+
+
+def paare_bilden(items):
+    """Dateien derselben Aufnahme (gleiches Verzeichnis, gleicher Stamm, z.B.
+    DSC_0001.JPG + DSC_0001.NEF) zu EINER Aufnahme zusammenfassen.
+
+    Beide tragen dieselben MakerNotes und damit dieselbe BurstGroupID; ohne
+    diese Zusammenfassung wird aus einer 3er-Reihe eine 6er-Serie, und das
+    NEF des Startbilds wandert aus dem Originalordner. Rueckgabe: Liste der
+    fuehrenden Records, jeweils mit r["begleiter"] = [weitere Records].
+    """
+    nach_stamm = {}
+    for r in items:
+        nach_stamm.setdefault((os.path.dirname(r["path"]), r["stem"]), []).append(r)
+    fuehrend = []
+    for dateien in nach_stamm.values():
+        dateien.sort(key=lambda r: (_format_rang(r), r["name"]))
+        kopf = dateien[0]
+        kopf["begleiter"] = dateien[1:]
+        fuehrend.append(kopf)
+    return fuehrend
+
+
+def dateien_der_aufnahme(rec):
+    """Die fuehrende Datei plus alle Begleitdateien."""
+    return [rec] + list(rec.get("begleiter") or [])
+
+
 def _serie_reisst(prev, cur, max_gap):
     """Liegt zwischen zwei Aufnahmen mit gleicher BurstGroupID zu viel Zeit?
 
@@ -741,7 +783,7 @@ def build_groups(recs, min_size=2, max_gap=None):
 
     groups = []
     for key in sorted(by_key):
-        items = sorted(by_key[key], key=sort_key)
+        items = sorted(paare_bilden(by_key[key]), key=sort_key)
 
         chunks, cur = [], [items[0]]
         for prev, cur_rec in zip(items, items[1:]):
@@ -752,10 +794,11 @@ def build_groups(recs, min_size=2, max_gap=None):
         chunks.append(cur)
 
         for c in chunks:
-            if len(c) >= min_size:
+            if len(c) >= min_size:          # zaehlt Aufnahmen, nicht Dateien
                 groups.append(c)
             else:
-                skipped.extend(c)
+                for r in c:
+                    skipped.extend(dateien_der_aufnahme(r))
     groups.sort(key=lambda g: sort_key(g[0]))
     return groups, skipped
 
@@ -815,12 +858,14 @@ def enforce_min_spacing(groups, min_spacing=32.0, langzeit_schwelle=14.0):
 
 
 def plan_group(group, destdir, ev_mode="truncate", typen=None, bleiben=1):
-    """Liefert (Startdatei, [(record, zielpfad, aktion), ...]).
+    """Liefert (Startdatei, [(record, zielpfad, aktion, aufnahme_nr), ...]).
 
-    Die ersten `bleiben` Bilder werden kopiert und bleiben damit im
+    Die ersten `bleiben` Aufnahmen werden kopiert und bleiben damit im
     Originalverzeichnis liegen; alle uebrigen werden verschoben. Normalerweise
-    ist das nur die Startdatei; bei nach Schaerfe geordneten Serien koennen es
-    mehrere sein (alle innerhalb der Schaerfetoleranz).
+    ist das nur die Startaufnahme; bei nach Schaerfe geordneten Serien koennen
+    es mehrere sein (alle innerhalb der Schaerfetoleranz). Begleitdateien
+    (RAW zum JPEG) bekommen denselben Namen mit eigener Endung und dieselbe
+    Aktion. G zaehlt Aufnahmen, nicht Dateien.
     """
     typen = typen or set()
     bleiben = max(1, int(bleiben))
@@ -829,12 +874,14 @@ def plan_group(group, destdir, ev_mode="truncate", typen=None, bleiben=1):
     ops = []
     for i, r in enumerate(group, 1):
         mk = marker(r, typen, ev_mode)
-        if i == 1:
-            newname = "{}_N1G{}_({}){}".format(start["stem"], size, mk, r["ext"])
-        else:
-            newname = "{}_N{}_({})_{}{}".format(start["stem"], i, mk, r["stem"], r["ext"])
         action = "copy" if i <= bleiben else "move"
-        ops.append((r, os.path.join(destdir, newname), action))
+        for datei in dateien_der_aufnahme(r):
+            if i == 1:
+                newname = "{}_N1G{}_({}){}".format(start["stem"], size, mk, datei["ext"])
+            else:
+                newname = "{}_N{}_({})_{}{}".format(start["stem"], i, mk,
+                                                   datei["stem"], datei["ext"])
+            ops.append((datei, os.path.join(destdir, newname), action, i))
     return start, ops
 
 
@@ -1216,7 +1263,7 @@ def _mb(n):
     return "{:.1f} MB".format(n / 1e6)
 
 
-def preflight_rechte(startdir, destdir, groups):
+def preflight_rechte(startdir, destdir, groups, bleiben_liste=None):
     """Alle im Verzeichnis startdir benoetigten Rechte pruefen."""
     fehler = []
 
@@ -1259,28 +1306,30 @@ def preflight_rechte(startdir, destdir, groups):
     nicht_lesbar, nicht_schreibbar, fremd = [], [], []
 
     geprueft = 0
-    for g in groups:
-        for i, r in enumerate(g):
-            pfad = r["path"]
-            geprueft += 1
-            if geprueft % 20 == 0:
-                FORT.zeige("pruefe Dateien: {} in {}".format(geprueft, startdir))
-            try:
-                with open(pfad, "rb") as fh:
-                    fh.read(1)
-            except OSError as exc:
-                nicht_lesbar.append("{} ({})".format(r["name"], exc.strerror or exc))
-                continue
-            if i == 0:
-                continue          # Startdatei wird nur gelesen und kopiert
-            if not os.access(pfad, os.W_OK):
-                nicht_schreibbar.append(r["name"])
-            elif not ist_root:
+    bleiben_liste = bleiben_liste or [1] * len(groups)
+    for g, bleiben in zip(groups, bleiben_liste):
+        for i, aufnahme in enumerate(g):
+            for r in dateien_der_aufnahme(aufnahme):
+                pfad = r["path"]
+                geprueft += 1
+                if geprueft % 20 == 0:
+                    FORT.zeige("pruefe Dateien: {} in {}".format(geprueft, startdir))
                 try:
-                    if os.stat(pfad).st_uid != euid:
-                        fremd.append(r["name"])
-                except OSError:
-                    pass
+                    with open(pfad, "rb") as fh:
+                        fh.read(1)
+                except OSError as exc:
+                    nicht_lesbar.append("{} ({})".format(r["name"], exc.strerror or exc))
+                    continue
+                if i < bleiben:
+                    continue          # wird nur gelesen und kopiert, bleibt liegen
+                if not os.access(pfad, os.W_OK):
+                    nicht_schreibbar.append(r["name"])
+                elif not ist_root:
+                    try:
+                        if os.stat(pfad).st_uid != euid:
+                            fremd.append(r["name"])
+                    except OSError:
+                        pass
 
     def sammeln(liste, text):
         if not liste:
@@ -1318,10 +1367,17 @@ def preflight_platz(plaene, reserve_prozent=2.0):
             fehler.append("Speicherplatz nicht pruefbar fuer {}: {}".format(pl["dir"], exc))
             continue
         eintrag = pro_geraet.setdefault(dev, [pl["dir"], 0, 0])
-        for g in pl["groups"]:
+        bleiben_liste = pl.get("bleiben") or [1] * len(pl["groups"])
+        for g, bleiben in zip(pl["groups"], bleiben_liste):
             try:
-                eintrag[1] += os.path.getsize(g[0]["path"])
-                eintrag[2] = max(eintrag[2], max(os.path.getsize(r["path"]) for r in g))
+                # Kopiert werden die behaltenen Aufnahmen samt Begleitdateien
+                # (Startaufnahme, bei Schaerfe-Serien auch Rang 2..k).
+                for aufnahme in g[:max(1, bleiben)]:
+                    for r in dateien_der_aufnahme(aufnahme):
+                        eintrag[1] += os.path.getsize(r["path"])
+                eintrag[2] = max(eintrag[2], max(os.path.getsize(r["path"])
+                                                 for a in g
+                                                 for r in dateien_der_aufnahme(a)))
             except OSError:
                 pass
 
@@ -1352,7 +1408,8 @@ def preflight(plaene, reserve_prozent=2.0):
     fehler = []
     for nr, pl in enumerate(plaene, 1):
         FORT.zeige("pruefe Rechte ({}/{}): {}".format(nr, len(plaene), pl["dir"]))
-        fehler += preflight_rechte(pl["dir"], pl["dest"], pl["groups"])
+        fehler += preflight_rechte(pl["dir"], pl["dest"], pl["groups"],
+                                   pl.get("bleiben"))
     if not fehler:
         FORT.zeige("pruefe Speicherplatz")
         fehler += preflight_platz(plaene, reserve_prozent)
@@ -1520,8 +1577,11 @@ def verarbeite(plan, args):
         if zuschlag > 0:
             zeit += " | Langzeitbelichtung {:g} s -> naechste Serie +{:g} s".format(
                 zuschlag, zuschlag)
-        print("Serie BurstGroupID={} | {} | Startdatei {} | {} Bilder | {}"
-              .format(start["gid"], typ_text(typen), start["name"], len(group), zeit))
+        n_begl = sum(len(r.get("begleiter") or []) for r in group)
+        print("Serie BurstGroupID={} | {} | Startdatei {} | {} Bilder{} | {}"
+              .format(start["gid"], typ_text(typen), start["name"], len(group),
+                      " (+{} Begleitdatei(en))".format(n_begl) if n_begl else "",
+                      zeit))
         log("serie gid={} dir={} typ={} start={} bilder={} zeit={} shift={:g}"
             .format(start["gid"], plan["dir"], typ_kurz(typen), start["name"],
                     len(group),
@@ -1535,8 +1595,8 @@ def verarbeite(plan, args):
 
         ziele_start, ziele_folge = [], []
         abgebrochen = False
-        for nr, (rec, target, action) in enumerate(ops):
-            ist_start = (nr == 0)
+        for rec, target, action, aufnahme_nr in ops:
+            ist_start = (aufnahme_nr == 1)
             eimer = ziele_start if ist_start else ziele_folge
             marker = "kopieren" if action == "copy" else "verschieben"
             aktion_name = "kopiert" if action == "copy" else "verschoben"
@@ -1551,7 +1611,7 @@ def verarbeite(plan, args):
                     print("  ! Serie abgebrochen: Startbild nicht ablegbar")
                     log("serie-abgebrochen gid={} dir={} start={} grund=ziel-existiert"
                         .format(start["gid"], plan["dir"], start["name"]))
-                    n_skip += len(ops) - 1
+                    n_skip += sum(1 for o in ops if o[3] > 1)
                     abgebrochen = True
                     break
                 continue
