@@ -151,7 +151,6 @@ apt-Pakete; alternativ ein venv (Paket python3-venv).
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import math
 import os
@@ -1209,13 +1208,61 @@ def nach_schaerfe_ordnen(group, toleranz=0.05):
     return sum(1 for r in group if (r.get("schaerfe") or 0.0) >= grenze)
 
 
-def bereits_erledigt(destdir, stem):
-    """Wurde diese Serie schon einmal abgelegt? Erkennbar am _N1G-Ergebnis.
+# Abgelegte Namen im Zielverzeichnis:
+#   <stamm>_N1G<n>_(<marker>)<ext>              Startaufnahme
+#   <start>_N<i>_(<marker>)_<originalname>      jede weitere Aufnahme
+_ABLAGE_START = re.compile(r"^(.*)_N1G\d+_\([^)]*\)\.[^.]+$")
+_ABLAGE_FOLGE = re.compile(r"^.*_N\d+_\([^)]*\)_(.+)$")
 
-    Noetig, seit bei Schaerfe-Serien mehrere Bilder liegen bleiben duerfen:
-    ohne diese Sperre wuerde ein zweiter Lauf sie erneut als Serie auffassen.
+
+def ablage_index(destdir):
+    """Was liegt schon in breihen/? Einmal je Verzeichnis gelesen.
+
+    Rueckgabe: (Staemme abgelegter Startaufnahmen, Originalnamen abgelegter
+    Folgeaufnahmen). Bewusst ueber os.listdir statt glob -- Verzeichnisnamen
+    mit [ ] * ? waeren sonst Suchmuster, und die Pruefung liefe ins Leere.
     """
-    return bool(glob.glob(os.path.join(destdir, glob.escape(stem) + "_N1G*")))
+    starts, originale = set(), set()
+    try:
+        namen = os.listdir(destdir)
+    except OSError:
+        return starts, originale
+    for n in namen:
+        m = _ABLAGE_START.match(n)
+        if m:
+            starts.add(m.group(1))
+            continue
+        m = _ABLAGE_FOLGE.match(n)
+        if m:
+            originale.add(m.group(1))
+    return starts, originale
+
+
+def ablage_status(group, index):
+    """Ist diese Serie schon abgelegt -- ganz, teilweise oder gar nicht?
+
+    Geprueft wird JEDE Aufnahme der Serie, nicht nur die Startaufnahme: bei
+    Schaerfe-Serien kann ein zweiter Lauf eine andere Aufnahme als schaerfste
+    waehlen, und nach einem Abbruch liegen Teile noch im Quellordner.
+    Behaltene Aufnahmen haben ihre Kopie in breihen/, verschobene sowieso --
+    was dort fehlt, wurde also nie abgelegt.
+
+    Rueckgabe: ("neu" | "erledigt" | "unvollstaendig", [fehlende Dateinamen])
+    """
+    starts, originale = index
+    fehlend = []
+    treffer = 0
+    for aufnahme in group:
+        if aufnahme["stem"] in starts or any(
+                d["name"] in originale for d in dateien_der_aufnahme(aufnahme)):
+            treffer += 1
+        else:
+            fehlend.append(aufnahme["name"])
+    if treffer == 0:
+        return "neu", fehlend
+    if not fehlend:
+        return "erledigt", fehlend
+    return "unvollstaendig", fehlend
 
 
 # ---------------------------------------------------------------------------
@@ -1548,6 +1595,7 @@ def verarbeite(plan, args):
 
     if not args.dry_run:
         os.makedirs(destdir, exist_ok=True)
+    index = ablage_index(destdir)
 
     for group, typen, bleiben, (neue_zeit, shift, zuschlag) in zip(
             plan["groups"], plan["typen"], plan["bleiben"], plan["schedule"]):
@@ -1557,11 +1605,25 @@ def verarbeite(plan, args):
         FORT.leeren()
         print(kopf)
 
-        if bereits_erledigt(destdir, group[0]["stem"]):
+        status, fehlend = ablage_status(group, index)
+        if status == "erledigt":
             print("Serie BurstGroupID={} | Startdatei {} -- bereits abgelegt, "
                   "uebersprungen".format(group[0]["gid"], group[0]["name"]))
             log("serie-uebersprungen gid={} dir={} start={} grund=bereits-abgelegt"
                 .format(group[0]["gid"], plan["dir"], group[0]["name"]))
+            n_skip += len(group)
+            print()
+            continue
+        if status == "unvollstaendig":
+            # Frueherer Lauf abgebrochen. Nicht automatisch weitermachen: die
+            # N-Nummern haengen an der urspruenglichen Serienzusammensetzung.
+            print("Serie BurstGroupID={} | Startdatei {} -- UNVOLLSTAENDIG abgelegt, "
+                  "nicht in breihen/: {}".format(group[0]["gid"], group[0]["name"],
+                                                 ", ".join(fehlend)))
+            print("  ! bitte von Hand pruefen; Serie wird nicht angefasst")
+            log("serie-unvollstaendig gid={} dir={} start={} fehlend={}".format(
+                group[0]["gid"], plan["dir"], group[0]["name"], ",".join(fehlend)))
+            n_err += 1
             n_skip += len(group)
             print()
             continue
