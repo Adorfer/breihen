@@ -36,6 +36,28 @@ Abstand zur naechsten Serie also 45 + 32 = 77 Sekunden.
 Im Startverzeichnis verbleibt nur die jeweils ERSTE Datei jeder Serie --
 unveraendert und unter ihrem Originalnamen.
 
+RAW+JPEG: Dateien derselben Aufnahme (gleicher Name, andere Endung, z.B.
+DSC_0001.JPG + DSC_0001.NEF) zaehlen als EINE Aufnahme. Das JPEG fuehrt, die
+uebrigen Formate laufen mit -- gleicher neuer Name mit eigener Endung,
+gleiche Aktion, gleiche Zeit:
+
+    DSC_0000_N1G3_(B+0).JPG   DSC_0000_N1G3_(B+0).NEF
+    DSC_0000_N2_(B-1)_DSC_0001.JPG   DSC_0000_N2_(B-1)_DSC_0001.NEF
+
+Serienerkennung: gruppiert wird nach (Kamera-Seriennummer, BurstGroupID).
+Die BurstGroupID ist kein Serienzaehler, sondern (Bildnummer x 32) mod 65536
+-- ein Bildzaehler, der alle 2048 Aufnahmen umlaeuft (nachgemessen an einer
+Z5II). Ein Ordner mit mehr als 2048 Aufnahmen kann daher fremde Serien
+gleicher ID enthalten; sie werden an unplausiblen Zeitluecken getrennt
+(--max-gap, per Vorgabe 2 x Belichtungszeit + 30 s). Bilder im
+Einzelbild-Modus haben die ID 0 und werden nie gruppiert -- Belichtungsreihen
+also im Serienbild-Modus (CL/CH) aufnehmen.
+
+Ein zweiter Lauf ueber dasselbe Verzeichnis ist unschaedlich: jede Serie,
+deren Aufnahmen schon in breihen/ liegen, wird uebersprungen. Liegt nur ein
+Teil dort (frueherer Lauf abgebrochen), wird die Serie als UNVOLLSTAENDIG
+gemeldet und nicht angefasst.
+
 Bearbeitet werden per Vorgabe nur echte BELICHTUNGSREIHEN, also Serien, in
 denen sich der ExposureBracketValue tatsaechlich aendert. Serien, deren Bilder
 alle mit derselben Belichtung aufgenommen wurden, bleiben unangetastet
