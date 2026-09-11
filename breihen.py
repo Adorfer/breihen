@@ -331,11 +331,17 @@ FORT = Fortschritt()
 #     2026-08-29 12:34:56 breihen[4711]: verschoben quelle=... ziel=...
 LOG_HANDLE = None
 
+# Fehler der Analysephase (nur lesend) -- fliessen in den Exit-Code ein.
+ANALYSE_FEHLER = 0
+
 
 def log(text):
     if LOG_HANDLE is None:
         return
     try:
+        # Mehrzeiliges (z.B. exiftool-Fehlertexte) auf eine Zeile falten --
+        # sonst zerbricht das Eine-Zeile-je-Ereignis-Format fuer grep.
+        text = " | ".join(t.strip() for t in str(text).splitlines() if t.strip())
         LOG_HANDLE.write("{} breihen[{}]: {}\n".format(
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), text))
         LOG_HANDLE.flush()
@@ -374,7 +380,8 @@ def exiftool_run(exiftool, opts, files):
     argfile = _write_argfile(files)
     try:
         cmd = [exiftool] + list(opts) + ["-charset", "filename=utf8", "-@", argfile]
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
     finally:
         try:
             os.unlink(argfile)
@@ -427,7 +434,8 @@ def read_metadata(paths, exiftool="exiftool", fortschritt=None):
         with tempfile.TemporaryFile("w+", encoding="utf-8",
                                     errors="replace") as fehlerkanal:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=fehlerkanal, text=True)
+                                    stderr=fehlerkanal, text=True,
+                                    encoding="utf-8", errors="replace")
             for zeile in proc.stdout:
                 teile.append(zeile)
                 if '"SourceFile"' in zeile:
@@ -447,7 +455,22 @@ def read_metadata(paths, exiftool="exiftool", fortschritt=None):
         if fehlertext:
             print(fehlertext, file=sys.stderr)
         return []
-    data = json.loads(out)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        # exiftool mittendrin gestorben (Netzlaufwerk weg, Signal) -> JSON
+        # abgeschnitten. Noch ist nichts geschrieben; Verzeichnis auslassen
+        # und laut melden statt den ganzen Lauf abzubrechen.
+        global ANALYSE_FEHLER
+        ANALYSE_FEHLER += 1
+        verz = os.path.dirname(paths[0])
+        FORT.leeren()
+        print("WARNUNG: Metadaten unvollstaendig gelesen (exiftool exit {}) -- "
+              "Verzeichnis ausgelassen: {}".format(proc.returncode, verz),
+              file=sys.stderr)
+        log("metadaten-fehler dir={} exit={} grund={}".format(
+            verz, proc.returncode, fehlertext or "JSON abgeschnitten"))
+        return []
 
     recs = []
     for d in data:
@@ -863,6 +886,12 @@ def _luma(pfad, kante=None):
     with Image.open(pfad) as im:
         im.draft("L", (kante, kante))
         grau = im.convert("L")
+        # draft() wirkt nur bei JPEG. TIFF (auch die dcraw_emu-Ausgabe) kaeme
+        # sonst in voller Groesse -- ganzzahlig auf dieselbe Arbeitsgroesse
+        # verkleinern, damit Speicher und Tempo im Rahmen bleiben.
+        faktor = int(math.ceil(max(grau.size) / float(kante)))
+        if faktor > 1:
+            grau = grau.reduce(faktor)
         return np.asarray(grau, dtype=np.float32)
 
 
@@ -1770,9 +1799,10 @@ def main(argv=None):
     else:
         print("Fertig: {} kopiert, {} verschoben, {} uebersprungen, {} Fehler."
               .format(n_copy, n_move, n_skip, n_err))
-    log("ende kopiert={} verschoben={} uebersprungen={} fehler={} laufzeit={}"
-        .format(n_copy, n_move, n_skip, n_err, laufzeit_text()))
-    return 1 if n_err else 0
+    log("ende kopiert={} verschoben={} uebersprungen={} fehler={} "
+        "analysefehler={} laufzeit={}".format(n_copy, n_move, n_skip, n_err,
+                                              ANALYSE_FEHLER, laufzeit_text()))
+    return 1 if (n_err or ANALYSE_FEHLER) else 0
 
 
 if __name__ == "__main__":
