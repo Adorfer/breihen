@@ -100,6 +100,19 @@ Die Erkennung von Photomatix basiert auf den EXIF-Metadaten, nicht auf dem
 Bildinhalt. Sie funktioniert daher nur, wenn die EXIF-Daten nicht entfernt
 wurden.
 
+## Tests
+
+```bash
+python3 tests/regression.py             # alle, ca. 25 s
+python3 tests/regression.py -k paar     # Auswahl nach Namen
+```
+
+Braucht zusätzlich ImageMagick (`sudo apt install imagemagick`) für die
+synthetischen Testbilder. Nikon-MakerNotes lassen sich nicht in selbst
+erzeugte Bilder schreiben; die Tests injizieren `BurstGroupID` & Co. deshalb
+beim Einlesen — Gruppieren, Messen, Kopieren, Verschieben und Zeitschreiben
+laufen echt.
+
 ## Lizenz
 
 [BSD-3-Clause](LICENSE)
